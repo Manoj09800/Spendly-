@@ -60,7 +60,12 @@ function fmt(n) {
 
 function monthKey(dateStr) {
   const d = new Date(dateStr);
-  return d.toLocaleString("en-US", { month: "short" });
+  return d.toLocaleString("en-US", { month: "short", year: "numeric" });
+}
+
+function monthSortValue(dateStr) {
+  const d = new Date(dateStr);
+  return d.getFullYear() * 12 + d.getMonth();
 }
 
 function loadScript(src) {
@@ -99,9 +104,111 @@ function parseDateGuess(s) {
   return new Date().toISOString();
 }
 
-// Heuristic line parser: finds a date + one or two amounts per line.
-// If two amounts are found, treats the last as a running balance and the
-// second-to-last as the transaction amount (common bank-statement layout).
+// Parses a spreadsheet already split into rows-of-cells (e.g. from
+// XLSX.utils.sheet_to_json with header:1). Looks for a header row naming
+// its columns (Date, Debit, Credit, Amount, Balance, Details...) and reads
+// each transaction directly from the right column — far more reliable
+// than guessing from flattened text, and handles the common bank-statement
+// layout of separate Debit/Credit columns.
+function parseStatementRows(grid) {
+  if (!grid || grid.length === 0) return null;
+
+  const norm = (c) => String(c ?? "").trim().toLowerCase();
+  let headerIdx = -1;
+  let headers = [];
+  for (let i = 0; i < Math.min(grid.length, 15); i++) {
+    const row = (grid[i] || []).map(norm);
+    const hasDate = row.some((c) => c.includes("date"));
+    const hasAmountish = row.some(
+      (c) => c.includes("debit") || c.includes("credit") || c.includes("amount") || c.includes("withdrawal") || c.includes("deposit")
+    );
+    if (hasDate && hasAmountish) {
+      headerIdx = i;
+      headers = row;
+      break;
+    }
+  }
+  if (headerIdx === -1) return null;
+
+  const findCol = (patterns) => headers.findIndex((h) => patterns.some((p) => h.includes(p)));
+  const dateCol = findCol(["value date", "date"]);
+  const debitCol = findCol(["debit", "withdrawal"]);
+  const creditCol = findCol(["credit", "deposit"]);
+  const amountCol = findCol(["amount"]);
+  const descCol = findCol(["detail", "description", "narration", "particular"]);
+
+  if (dateCol === -1 || (debitCol === -1 && creditCol === -1 && amountCol === -1)) return null;
+
+  const toNumber = (v) => {
+    if (v === "" || v == null) return NaN;
+    if (typeof v === "number") return v;
+    return parseFloat(String(v).replace(/[^\d.-]/g, ""));
+  };
+
+  const results = [];
+  for (let i = headerIdx + 1; i < grid.length; i++) {
+    const row = grid[i] || [];
+    const rawDate = row[dateCol];
+    if (rawDate === "" || rawDate == null) continue;
+
+    let dateVal;
+    if (rawDate instanceof Date) dateVal = rawDate.toISOString();
+    else dateVal = parseDateGuess(String(rawDate));
+
+    let amount = 0;
+    let type = "expense";
+    const debitVal = debitCol >= 0 ? toNumber(row[debitCol]) : NaN;
+    const creditVal = creditCol >= 0 ? toNumber(row[creditCol]) : NaN;
+
+    if (!isNaN(debitVal) && debitVal > 0) {
+      amount = debitVal;
+      type = "expense";
+    } else if (!isNaN(creditVal) && creditVal > 0) {
+      amount = creditVal;
+      type = "income";
+    } else if (amountCol >= 0) {
+      const raw = toNumber(row[amountCol]);
+      if (!isNaN(raw) && raw !== 0) {
+        amount = Math.abs(raw);
+        type = raw < 0 ? "expense" : "income";
+      }
+    }
+    if (!amount || amount <= 0) continue;
+
+    const desc = descCol >= 0 ? String(row[descCol] ?? "").slice(0, 60) : "Statement entry";
+    results.push({ date: dateVal, description: desc || "Statement entry", amount, type });
+  }
+  return results;
+}
+
+// Groups a PDF page's text items into visual rows by their y-position,
+// rather than trusting text-flow line breaks — table cells often don't
+// carry reliable end-of-line flags, but their vertical position is exact.
+function pageTextToRows(content) {
+  const tolerance = 2.5;
+  const rows = []; // { y, items: [{x, str}] }
+  for (const it of content.items) {
+    if (!it.str || !it.str.trim()) continue;
+    const y = it.transform[5];
+    const x = it.transform[4];
+    let row = rows.find((r) => Math.abs(r.y - y) <= tolerance);
+    if (!row) {
+      row = { y, items: [] };
+      rows.push(row);
+    }
+    row.items.push({ x, str: it.str });
+  }
+  rows.sort((a, b) => b.y - a.y); // top of page first
+  return rows
+    .map((r) =>
+      r.items
+        .sort((a, b) => a.x - b.x)
+        .map((i) => i.str)
+        .join(" ")
+    )
+    .join("\n");
+}
+
 function parseStatementText(text) {
   const dateRe = /(\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{2,4})/;
   const amtRe = /(?:₹|rs\.?|inr)?\s?-?[\d,]+\.\d{2}\b/gi;
@@ -119,12 +226,21 @@ function parseStatementText(text) {
     if (!amount || isNaN(amount) || amount <= 0) continue;
 
     const lower = line.toLowerCase();
-    const isIncome =
-      /(credit|cr\b|deposit|received|salary|refund)/.test(lower) && !/(debit|dr\b)/.test(lower);
+    // Common Indian bank-statement shorthand: WDL/DR = debit (expense),
+    // DEP/CR = credit (income). Checked as priority signals first, since
+    // generic words like "credit" can appear inside reference numbers.
+    let isIncome;
+    if (/\bwdl\b|\bdr\b|withdrawal|debited/.test(lower)) {
+      isIncome = false;
+    } else if (/\bdep\b|\bcr\b|credit|deposit|received|salary|refund/.test(lower)) {
+      isIncome = true;
+    } else {
+      isIncome = false;
+    }
 
     let desc = line.replace(dateMatch[0], "");
     amounts.forEach((a) => (desc = desc.replace(a, "")));
-    desc = desc.replace(/\s{2,}/g, " ").trim().slice(0, 60);
+    desc = desc.replace(/[-|]+/g, " ").replace(/\s{2,}/g, " ").trim().slice(0, 60);
 
     results.push({
       date: parseDateGuess(dateMatch[0]),
@@ -504,39 +620,151 @@ function Ledger({ txns, onDelete }) {
 }
 
 function ReportsView({ txns, onDelete }) {
-  const byCategory = useMemo(() => {
-    const map = {};
+  const [selectedMonth, setSelectedMonth] = useState("all");
+
+  const availableMonths = useMemo(() => {
+    const map = new Map();
     for (const t of txns) {
-      if (t.type !== "expense") continue;
-      map[t.category] = (map[t.category] || 0) + t.amount;
+      const key = monthKey(t.date);
+      if (!map.has(key)) map.set(key, monthSortValue(t.date));
     }
-    return Object.entries(map)
-      .map(([id, value]) => ({ name: CAT_LOOKUP[id]?.label || id, value }))
-      .sort((a, b) => b.value - a.value);
+    return Array.from(map.entries())
+      .sort((a, b) => b[1] - a[1])
+      .map(([key]) => key);
   }, [txns]);
 
   const monthly = useMemo(() => {
     const map = {};
     for (const t of txns) {
       const k = monthKey(t.date);
-      if (!map[k]) map[k] = { month: k, income: 0, expense: 0 };
+      if (!map[k]) map[k] = { month: k, income: 0, expense: 0, sort: monthSortValue(t.date) };
       if (t.type === "income") map[k].income += t.amount;
       if (t.type === "expense") map[k].expense += t.amount;
     }
-    return Object.values(map).slice(-6);
+    return Object.values(map).sort((a, b) => a.sort - b.sort).slice(-12);
   }, [txns]);
+
+  const highestSpendMonth = useMemo(() => {
+    if (monthly.length === 0) return null;
+    return monthly.reduce((max, m) => (m.expense > (max?.expense ?? -1) ? m : max), null);
+  }, [monthly]);
+
+  const activeMonth = selectedMonth === "all" ? availableMonths[0] : selectedMonth;
+
+  const filteredTxns = useMemo(() => {
+    if (selectedMonth === "all") return txns;
+    return txns.filter((t) => monthKey(t.date) === selectedMonth);
+  }, [txns, selectedMonth]);
+
+  const recap = useMemo(() => {
+    if (!activeMonth) return null;
+    const inMonth = txns.filter((t) => monthKey(t.date) === activeMonth);
+    const spent = inMonth.filter((t) => t.type === "expense").reduce((s, t) => s + t.amount, 0);
+
+    const catMap = {};
+    for (const t of inMonth) {
+      if (t.type !== "expense") continue;
+      catMap[t.category] = (catMap[t.category] || 0) + t.amount;
+    }
+    const topCats = Object.entries(catMap)
+      .map(([id, value]) => ({ name: CAT_LOOKUP[id]?.label || id, value }))
+      .sort((a, b) => b.value - a.value)
+      .slice(0, 3);
+
+    const idx = availableMonths.indexOf(activeMonth);
+    const prevMonthKey = idx >= 0 ? availableMonths[idx + 1] : null;
+    let change = null;
+    if (prevMonthKey) {
+      const prevSpent = txns
+        .filter((t) => monthKey(t.date) === prevMonthKey && t.type === "expense")
+        .reduce((s, t) => s + t.amount, 0);
+      if (prevSpent > 0) change = ((spent - prevSpent) / prevSpent) * 100;
+    }
+
+    return { month: activeMonth, spent, topCats, change };
+  }, [txns, activeMonth, availableMonths]);
+
+  const byCategory = useMemo(() => {
+    const map = {};
+    for (const t of filteredTxns) {
+      if (t.type !== "expense") continue;
+      map[t.category] = (map[t.category] || 0) + t.amount;
+    }
+    return Object.entries(map)
+      .map(([id, value]) => ({ name: CAT_LOOKUP[id]?.label || id, value }))
+      .sort((a, b) => b.value - a.value);
+  }, [filteredTxns]);
 
   return (
     <div className="px-5 pt-8">
-      <div className="f-display text-2xl font-semibold mb-6">Reports</div>
+      <div className="flex items-center justify-between mb-6">
+        <div className="f-display text-2xl font-semibold">Reports</div>
+        {availableMonths.length > 0 && (
+          <select
+            value={selectedMonth}
+            onChange={(e) => setSelectedMonth(e.target.value)}
+            className="f-body text-xs rounded-lg px-2 py-1.5"
+            style={{ background: COLORS.panelRaised, color: COLORS.text, border: `1px solid ${COLORS.line}` }}
+          >
+            <option value="all">All time</option>
+            {availableMonths.map((m) => (
+              <option key={m} value={m}>{m}</option>
+            ))}
+          </select>
+        )}
+      </div>
 
       {txns.length === 0 ? (
         <EmptyState />
       ) : (
         <>
+          {recap && (
+            <div className="rounded-2xl p-4 mb-5" style={{ background: COLORS.panel, border: `1px solid ${COLORS.line}` }}>
+              <div className="f-body text-sm mb-1" style={{ color: COLORS.muted }}>
+                {recap.month} recap
+              </div>
+              <div className="f-display text-2xl font-semibold mb-1">₹{fmt(recap.spent)}</div>
+              {recap.change !== null && (
+                <div
+                  className="f-body text-xs mb-3"
+                  style={{ color: recap.change > 0 ? COLORS.coral : COLORS.jade }}
+                >
+                  {recap.change > 0 ? "▲" : "▼"} {Math.abs(recap.change).toFixed(0)}% vs previous month
+                </div>
+              )}
+              {recap.topCats.length > 0 && (
+                <div className="flex flex-col gap-1.5 mt-2">
+                  {recap.topCats.map((c) => (
+                    <div key={c.name} className="f-body flex items-center justify-between text-sm">
+                      <span style={{ color: COLORS.muted }}>{c.name}</span>
+                      <span className="f-mono">₹{fmt(c.value)}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {highestSpendMonth && monthly.length > 1 && (
+            <div
+              className="rounded-2xl p-4 mb-5 flex items-center gap-3"
+              style={{ background: COLORS.panel, border: `1px solid ${COLORS.line}` }}
+            >
+              <div className="w-8 h-8 rounded-full flex items-center justify-center shrink-0" style={{ background: COLORS.gold + "22" }}>
+                <TrendingUp size={15} color={COLORS.gold} />
+              </div>
+              <div className="f-body text-sm">
+                <span style={{ color: COLORS.muted }}>Highest spending month: </span>
+                <span>{highestSpendMonth.month} (₹{fmt(highestSpendMonth.expense)})</span>
+              </div>
+            </div>
+          )}
+
           {byCategory.length > 0 && (
             <div className="rounded-2xl p-4 mb-5" style={{ background: COLORS.panel, border: `1px solid ${COLORS.line}` }}>
-              <div className="f-body text-sm mb-2" style={{ color: COLORS.muted }}>Spending by category</div>
+              <div className="f-body text-sm mb-2" style={{ color: COLORS.muted }}>
+                Spending by category {selectedMonth !== "all" ? `— ${selectedMonth}` : ""}
+              </div>
               <div style={{ width: "100%", height: 200 }}>
                 <ResponsiveContainer>
                   <PieChart>
@@ -584,8 +812,10 @@ function ReportsView({ txns, onDelete }) {
             </div>
           )}
 
-          <div className="f-body text-sm mb-3" style={{ color: COLORS.muted }}>All entries</div>
-          <Ledger txns={txns} onDelete={onDelete} />
+          <div className="f-body text-sm mb-3" style={{ color: COLORS.muted }}>
+            {selectedMonth === "all" ? "All entries" : `${selectedMonth} entries`}
+          </div>
+          <Ledger txns={filteredTxns} onDelete={onDelete} />
         </>
       )}
     </div>
@@ -746,6 +976,7 @@ function StatementView({ onBulkAdd }) {
   const [status, setStatus] = useState("");
   const [error, setError] = useState("");
   const [rows, setRows] = useState([]);
+  const [pasteText, setPasteText] = useState("");
 
   function finishParse(parsed) {
     setStatus("");
@@ -783,7 +1014,7 @@ function StatementView({ onBulkAdd }) {
         setStatus(`Reading page ${i} of ${doc.numPages}…`);
         const page = await doc.getPage(i);
         const content = await page.getTextContent();
-        fullText += content.items.map((it) => it.str).join(" ") + "\n";
+        fullText += pageTextToRows(content) + "\n";
       }
       finishParse(parseStatementText(fullText));
     } catch (e) {
@@ -796,10 +1027,17 @@ function StatementView({ onBulkAdd }) {
     setError(""); setRows([]); setStatus("Reading file…");
     try {
       const buf = await file.arrayBuffer();
-      const wb = XLSX.read(buf, { type: "array" });
+      const wb = XLSX.read(buf, { type: "array", cellDates: true });
       const sheet = wb.Sheets[wb.SheetNames[0]];
-      const csv = XLSX.utils.sheet_to_csv(sheet);
-      finishParse(parseStatementText(csv.replace(/,/g, " ")));
+      const grid = XLSX.utils.sheet_to_json(sheet, { header: 1, raw: true, defval: "" });
+      const byColumns = parseStatementRows(grid);
+      if (byColumns && byColumns.length > 0) {
+        finishParse(byColumns);
+      } else {
+        // Fall back to the generic text parser for files with no clear header row
+        const csv = XLSX.utils.sheet_to_csv(sheet);
+        finishParse(parseStatementText(csv));
+      }
     } catch (e) {
       setError("Couldn't read that spreadsheet.");
       setStatus("");
@@ -840,8 +1078,8 @@ function StatementView({ onBulkAdd }) {
         Upload a PDF, Excel/CSV, or a photo of your statement. Nothing is added until you review it below.
       </div>
 
-      <div className="flex gap-2 mb-5">
-        {[["pdf", "PDF"], ["excel", "Excel / CSV"], ["image", "Photo"]].map(([id, label]) => (
+      <div className="flex gap-2 mb-5 flex-wrap">
+        {[["pdf", "PDF"], ["excel", "Excel / CSV"], ["image", "Photo"], ["paste", "Paste SMS/text"]].map(([id, label]) => (
           <button
             key={id}
             onClick={() => { setMode(id); setRows([]); setError(""); setStatus(""); }}
@@ -877,6 +1115,33 @@ function StatementView({ onBulkAdd }) {
           <FilePicker accept="image/*" onFile={handleImageFile} label="Choose photo" />
           <div className="f-body text-xs mt-2" style={{ color: COLORS.muted }}>
             Photo scanning is the least reliable mode — double-check every row below.
+          </div>
+        </div>
+      )}
+      {mode === "paste" && (
+        <div className="rounded-2xl p-4 mb-4" style={{ background: COLORS.panel, border: `1px solid ${COLORS.line}` }}>
+          <label className="text-xs mb-1 block" style={{ color: COLORS.muted }}>
+            Paste bank SMS alerts or any statement text
+          </label>
+          <textarea
+            value={pasteText}
+            onChange={(e) => setPasteText(e.target.value)}
+            rows={6}
+            placeholder={"e.g. 01-05-2026 Rs.332.00 debited from your a/c...\n(paste several messages at once — one per line works too)"}
+            className="w-full rounded-xl px-3 py-2.5 mb-3 outline-none text-sm"
+            style={{ background: COLORS.panelRaised, border: `1px solid ${COLORS.line}`, color: COLORS.text }}
+          />
+          <button
+            onClick={() => finishParse(parseStatementText(pasteText))}
+            disabled={!pasteText.trim()}
+            className="w-full py-2.5 rounded-xl text-sm font-medium disabled:opacity-40"
+            style={{ background: COLORS.jade, color: COLORS.void }}
+          >
+            Find transactions
+          </button>
+          <div className="f-body text-xs mt-2" style={{ color: COLORS.muted }}>
+            No app can read your SMS inbox automatically for privacy/security reasons — but copying and
+            pasting a batch here is fast and stays private, nothing leaves your browser.
           </div>
         </div>
       )}
@@ -996,4 +1261,5 @@ function ReviewRow({ row, onChange }) {
       </div>
     </div>
   );
-    }
+                    }
+
