@@ -1,0 +1,7 @@
+<svg width="120" height="120" viewBox="0 0 120 120" xmlns="http://www.w3.org/2000/svg">
+  <circle cx="60" cy="60" r="58" fill="#0A0F0D" stroke="#2BAE81" stroke-width="2"/>
+  <circle cx="60" cy="60" r="46" fill="#2BAE81"/>
+  <text x="60" y="78" font-family="Georgia, 'Times New Roman', serif" font-size="52" font-weight="700" fill="#0A0F0D" text-anchor="middle">S</text>
+  <path d="M28 82 L44 66 L57 75 L92 38" stroke="#E3A63E" stroke-width="5" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="92" cy="38" r="5" fill="#E3A63E"/>
+</svg>
