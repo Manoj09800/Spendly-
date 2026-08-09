@@ -2,7 +2,7 @@ import { useState, useEffect, useMemo, useRef } from "react";
 import {
   Home, PlusCircle, PieChart as PieIcon, Wallet, Utensils, Car, ShoppingBag,
   Zap, Heart, Film, MoreHorizontal, Briefcase, Gift, TrendingUp, PiggyBank,
-  Trash2, ArrowUpRight, ArrowDownRight, X, UploadCloud, Loader2, FileStack
+  Trash2, ArrowUpRight, ArrowDownRight, X, UploadCloud, Loader2, FileStack, Sun, Moon
 } from "lucide-react";
 import {
   PieChart, Pie, Cell, ResponsiveContainer, BarChart, Bar, XAxis, YAxis,
@@ -11,7 +11,7 @@ import {
 import * as XLSX from "xlsx";
 import { supabase } from "./supabaseClient.js";
 
-const COLORS = {
+const DARK_COLORS = {
   void: "#0A0F0D",
   panel: "#121913",
   panelRaised: "#1A231C",
@@ -24,6 +24,29 @@ const COLORS = {
   coral: "#E8604C",
   sky: "#5B93D6",
 };
+
+const LIGHT_COLORS = {
+  void: "#F7F8F6",
+  panel: "#FFFFFF",
+  panelRaised: "#F0F2EE",
+  line: "#DEE3DD",
+  text: "#151B17",
+  muted: "#5D6C60",
+  jade: "#1E9973",
+  jadeDim: "#167459",
+  gold: "#B87A22",
+  coral: "#C94430",
+  sky: "#3768AE",
+};
+
+// Mutable on purpose: toggling theme reassigns these values in place, so
+// every component's existing `COLORS.xxx` references pick up the new
+// palette on the next render without each one needing its own theme prop.
+let COLORS = { ...DARK_COLORS };
+
+function applyTheme(mode) {
+  Object.assign(COLORS, mode === "light" ? LIGHT_COLORS : DARK_COLORS);
+}
 
 function Logo({ size = 28 }) {
   return (
@@ -268,6 +291,27 @@ function parseStatementText(text) {
 
 export default function App() {
   const [session, setSession] = useState(undefined); // undefined = checking, null = signed out
+  const [themeMode, setThemeMode] = useState(() => {
+    try {
+      return localStorage.getItem("spendsy-theme") || "dark";
+    } catch (e) {
+      return "dark";
+    }
+  });
+
+  // Applied synchronously during render (not in an effect) so every child
+  // component sees the correct COLORS values on this same render pass.
+  applyTheme(themeMode);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem("spendsy-theme", themeMode);
+    } catch (e) {}
+  }, [themeMode]);
+
+  function toggleTheme() {
+    setThemeMode((m) => (m === "dark" ? "light" : "dark"));
+  }
 
   useEffect(() => {
     supabase.auth.getSession().then(({ data }) => setSession(data.session));
@@ -285,12 +329,25 @@ export default function App() {
     );
   }
 
-  if (!session) return <AuthView />;
+  if (!session) return <AuthView themeMode={themeMode} onToggleTheme={toggleTheme} />;
 
-  return <MoneyManager session={session} />;
+  return <MoneyManager session={session} themeMode={themeMode} onToggleTheme={toggleTheme} />;
 }
 
-function AuthView() {
+function ThemeToggle({ themeMode, onToggle }) {
+  return (
+    <button
+      onClick={onToggle}
+      className="w-7 h-7 rounded-full flex items-center justify-center shrink-0"
+      style={{ background: COLORS.panelRaised, border: `1px solid ${COLORS.line}`, color: COLORS.muted }}
+      aria-label="Toggle light/dark mode"
+    >
+      {themeMode === "dark" ? <Sun size={13} /> : <Moon size={13} />}
+    </button>
+  );
+}
+
+function AuthView({ themeMode, onToggleTheme }) {
   const [mode, setMode] = useState("signin"); // signin | signup
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -326,9 +383,12 @@ function AuthView() {
         .f-mono { font-family: 'JetBrains Mono', monospace; }
       `}</style>
       <div className="flex-1 flex flex-col justify-center px-6">
-        <div className="flex items-center gap-2.5 mb-1">
-          <Logo size={34} />
-          <div className="f-display text-3xl font-semibold">Spendly</div>
+        <div className="flex items-center justify-between mb-1">
+          <div className="flex items-center gap-2.5">
+            <Logo size={34} />
+            <div className="f-display text-3xl font-semibold">Spendsy</div>
+          </div>
+          <ThemeToggle themeMode={themeMode} onToggle={onToggleTheme} />
         </div>
         <div className="f-body text-sm mb-8" style={{ color: COLORS.muted }}>
           {mode === "signup" ? "Create an account to sync across your devices" : "Sign in to your account"}
@@ -376,7 +436,7 @@ function AuthView() {
   );
 }
 
-function MoneyManager({ session }) {
+function MoneyManager({ session, themeMode, onToggleTheme }) {
   const user = session.user;
   const [tab, setTab] = useState("home");
   const [txns, setTxns] = useState([]);
@@ -511,13 +571,16 @@ function MoneyManager({ session }) {
           <Logo size={22} />
           <span className="f-body text-xs truncate" style={{ color: COLORS.muted }}>{user.email}</span>
         </div>
-        <button
-          onClick={() => supabase.auth.signOut()}
-          className="f-body text-xs"
-          style={{ color: COLORS.muted }}
-        >
-          Sign out
-        </button>
+        <div className="flex items-center gap-3 shrink-0">
+          <ThemeToggle themeMode={themeMode} onToggle={onToggleTheme} />
+          <button
+            onClick={() => supabase.auth.signOut()}
+            className="f-body text-xs"
+            style={{ color: COLORS.muted }}
+          >
+            Sign out
+          </button>
+        </div>
       </div>
 
       <div className="flex-1 overflow-y-auto no-scrollbar pb-24">
@@ -946,6 +1009,18 @@ function ReportsView({ txns, onDelete, accounts }) {
             {selectedMonth === "all" ? "All entries" : `${selectedMonth} entries`}
           </div>
           <Ledger txns={filteredTxns} onDelete={onDelete} />
+
+          <div className="f-body text-center text-xs mt-10 mb-6" style={{ color: COLORS.muted }}>
+            <div>© {new Date().getFullYear()} Spendsy. All rights reserved.</div>
+            <div className="mt-1">Built with ❤️ by Manoj</div>
+            <div className="mt-2">
+              <a href="/privacy-policy.html" target="_blank" rel="noopener noreferrer" style={{ color: COLORS.muted, textDecoration: "underline" }}>Privacy Policy</a>
+              {" | "}
+              <a href="/terms.html" target="_blank" rel="noopener noreferrer" style={{ color: COLORS.muted, textDecoration: "underline" }}>Terms of Service</a>
+              {" | "}
+              <a href="/disclaimer.html" target="_blank" rel="noopener noreferrer" style={{ color: COLORS.muted, textDecoration: "underline" }}>Disclaimer</a>
+            </div>
+          </div>
         </>
       )}
     </div>
